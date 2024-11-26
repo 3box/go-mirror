@@ -5,7 +5,6 @@ import (
 
 	"go.uber.org/dig"
 
-	"github.com/3box/go-mirror/common/cert"
 	"github.com/3box/go-mirror/common/config"
 	"github.com/3box/go-mirror/common/logging"
 	"github.com/3box/go-mirror/common/metric"
@@ -36,11 +35,6 @@ func BuildContainer(ctx context.Context) (*dig.Container, error) {
 
 	// Provide metrics
 	if err = container.Provide(metric.NewOTelMetricService); err != nil {
-		return nil, err
-	}
-
-	// Provide cert manager
-	if err = container.Provide(cert.NewACMECertManager); err != nil {
 		return nil, err
 	}
 

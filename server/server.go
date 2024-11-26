@@ -2,20 +2,12 @@ package server
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/pem"
 	"errors"
 	"fmt"
-	"math/big"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -23,7 +15,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/3box/go-mirror/common/cert"
 	"github.com/3box/go-mirror/common/config"
 	"github.com/3box/go-mirror/common/logging"
 	"github.com/3box/go-mirror/common/metric"
@@ -40,11 +31,9 @@ type serverImpl struct {
 	ctx             context.Context
 	cfg             *config.Config
 	logger          logging.Logger
-	proxyServer     *http.Server
-	challengeServer *http.Server
+	server          *http.Server
 	proxyController controllers.ProxyController
 	metrics         metric.MetricService
-	certManager     cert.CertManager
 }
 
 func NewServer(
@@ -53,7 +42,6 @@ func NewServer(
 	logger logging.Logger,
 	metrics metric.MetricService,
 	proxyController controllers.ProxyController,
-	certManager cert.CertManager,
 ) (*gin.Engine, Server) {
 	router := gin.New()
 
@@ -61,26 +49,12 @@ func NewServer(
 		ctx:    ctx,
 		cfg:    cfg,
 		logger: logger,
-		proxyServer: &http.Server{
+		server: &http.Server{
 			Handler: router,
 			Addr:    cfg.Proxy.ListenAddr,
 		},
 		proxyController: proxyController,
 		metrics:         metrics,
-	}
-
-	if cfg.Proxy.TLSEnabled && certManager != nil {
-		server.proxyServer.TLSConfig = &tls.Config{
-			GetCertificate: certManager.GetCertificate,
-			MinVersion:     tls.VersionTLS12,
-			MaxVersion:     tls.VersionTLS13,
-		}
-
-		// HTTP server for ACME challenges
-		server.challengeServer = &http.Server{
-			Addr:    cfg.Cert.ListenAddr,
-			Handler: certManager.GetHTTPHandler(),
-		}
 	}
 
 	// Match all paths including root
@@ -90,10 +64,7 @@ func NewServer(
 }
 
 func (_this serverImpl) handleProxy(c *gin.Context) {
-	if strings.HasPrefix(c.Request.URL.Path, "/.well-known/acme-challenge/") {
-		_this.certManager.GetHTTPHandler().ServeHTTP(c.Writer, c.Request)
-		return
-	} else if strings.HasPrefix(c.Request.URL.Path, "/metrics") {
+	if strings.HasPrefix(c.Request.URL.Path, "/metrics") {
 		_this.metrics.GetPrometheusHandler()(c)
 		return
 	}
@@ -115,49 +86,22 @@ func (_this serverImpl) handleProxy(c *gin.Context) {
 func (_this serverImpl) Run() {
 	// Set up a server context
 	serverCtx, serverCtxCancel := context.WithCancel(_this.ctx)
-	_this.proxyServer.BaseContext = func(net.Listener) context.Context {
+	_this.server.BaseContext = func(net.Listener) context.Context {
 		return serverCtx
 	}
 
 	wg := sync.WaitGroup{}
-	wg.Add(3)
+	wg.Add(2)
 
 	// Start the proxy server
 	go func() {
 		defer wg.Done()
 
-		var err error
-		if _this.cfg.Cert.Enabled {
-			_this.logger.Infof("server: proxy server starting with ACME on %s", _this.proxyServer.Addr)
-			err = _this.proxyServer.ListenAndServeTLS("", "") // Empty strings trigger cert manager
-		} else if _this.cfg.Cert.TestMode {
-			// Generate a self-signed certificate for testing
-			crt, err := generateSelfSignedCert()
-			if err != nil {
-				_this.logger.Fatalf("failed to generate certificate: %v", err)
-			}
-			_this.logger.Infof("server: proxy server starting with self-signed cert on %s", _this.proxyServer.Addr)
-			err = _this.proxyServer.ListenAndServeTLS(crt.CertFile, crt.KeyFile)
-		} else {
-			// No TLS
-			_this.logger.Infof("server: proxy server starting on %s", _this.proxyServer.Addr)
-			err = _this.proxyServer.ListenAndServe()
-		}
+		_this.logger.Infof("server: proxy server starting on %s", _this.server.Addr)
+		err := _this.server.ListenAndServe()
 
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			_this.logger.Fatalf("proxy server listen error: %s", err)
-		}
-	}()
-
-	// Start the server for ACME challenges
-	go func() {
-		defer wg.Done()
-
-		if _this.cfg.Cert.Enabled {
-			_this.logger.Infof("server: challenge server starting on %s", _this.challengeServer.Addr)
-			if err := _this.challengeServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				_this.logger.Errorw("challenge server listen error", "error", err)
-			}
 		}
 	}()
 
@@ -186,96 +130,12 @@ func (_this serverImpl) Run() {
 	wg.Wait()
 }
 
-func generateSelfSignedCert() (*struct{ CertFile, KeyFile string }, error) {
-	dir, err := os.MkdirTemp("", "cert")
-	if err != nil {
-		return nil, err
-	}
-
-	certFile := filepath.Join(dir, "cert.pem")
-	keyFile := filepath.Join(dir, "key.pem")
-
-	// Generate private key
-	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		return nil, err
-	}
-
-	// Create certificate template
-	template := x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject: pkix.Name{
-			Organization: []string{"Test Organization"},
-		},
-		NotBefore: time.Now(),
-		NotAfter:  time.Now().Add(time.Hour * 24 * 180), // 180 days
-		KeyUsage:  x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage: []x509.ExtKeyUsage{
-			x509.ExtKeyUsageServerAuth,
-		},
-		BasicConstraintsValid: true,
-		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("100.66.104.46")},
-	}
-
-	// Create certificate
-	derBytes, err := x509.CreateCertificate(
-		rand.Reader,
-		&template,
-		&template,
-		&privateKey.PublicKey,
-		privateKey,
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	// Write certificate to file
-	certOut, err := os.Create(certFile)
-	if err != nil {
-		return nil, err
-	}
-	defer certOut.Close()
-	if err := pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes}); err != nil {
-		return nil, err
-	}
-
-	// Write private key to file
-	keyOut, err := os.Create(keyFile)
-	if err != nil {
-		return nil, err
-	}
-	defer keyOut.Close()
-	if err := pem.Encode(keyOut, &pem.Block{
-		Type:  "RSA PRIVATE KEY",
-		Bytes: x509.MarshalPKCS1PrivateKey(privateKey),
-	}); err != nil {
-		return nil, err
-	}
-
-	return &struct{ CertFile, KeyFile string }{
-		CertFile: certFile,
-		KeyFile:  keyFile,
-	}, nil
-}
-
 func (_this serverImpl) Stop() error {
 	ctx, cancel := context.WithTimeout(_this.ctx, 5*time.Second)
 	defer cancel()
 
-	var errs []error
-
-	if _this.challengeServer != nil {
-		if err := _this.challengeServer.Shutdown(ctx); err != nil {
-			errs = append(errs, fmt.Errorf("challenge server shutdown error: %w", err))
-		}
-	}
-
-	if err := _this.proxyServer.Shutdown(ctx); err != nil {
-		errs = append(errs, fmt.Errorf("proxy server shutdown error: %w", err))
-	}
-
-	if len(errs) > 0 {
-		return fmt.Errorf("shutdown errors: %v", errs)
+	if err := _this.server.Shutdown(ctx); err != nil {
+		return fmt.Errorf("proxy server shutdown error: %w", err)
 	}
 
 	return nil

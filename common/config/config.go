@@ -9,16 +9,7 @@ import (
 )
 
 type Config struct {
-	Cert  CertConfig
 	Proxy ProxyConfig
-}
-
-type CertConfig struct {
-	Enabled    bool
-	Domains    []string
-	CacheDir   string
-	TestMode   bool
-	ListenAddr string
 }
 
 type ProxyConfig struct {
