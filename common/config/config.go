@@ -9,6 +9,8 @@ import (
 	"github.com/3box/go-proxy/common/logging"
 )
 
+const ServiceName = "go-proxy"
+
 const (
 	defaultProxyListenPort   = "8080"
 	defaultMetricsListenPort = "9464"

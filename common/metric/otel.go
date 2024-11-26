@@ -15,10 +15,9 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/3box/go-proxy/common/config"
 	"github.com/3box/go-proxy/common/logging"
 )
-
-const serviceName = "go-proxy"
 
 var _ MetricService = &otelMetricService{}
 
@@ -41,7 +40,7 @@ func NewOTelMetricService() (MetricService, error) {
 		sdk.WithReader(exporter),
 	)
 
-	meter := provider.Meter(serviceName)
+	meter := provider.Meter(config.ServiceName)
 
 	return &otelMetricService{
 		meter:  meter,
@@ -80,7 +79,7 @@ func (_this otelMetricService) RecordRequest(ctx context.Context, name, method, 
 	normalizedPath := normalizePath(path)
 
 	counter, err := _this.meter.Int64Counter(
-		fmt.Sprintf("%s_%s_requests_total", serviceName, name),
+		fmt.Sprintf("%s_%s_requests_total", config.ServiceName, name),
 		metric.WithDescription("Total number of requests received"),
 	)
 	if err != nil {
@@ -107,7 +106,7 @@ func (_this otelMetricService) RecordDuration(ctx context.Context, name string, 
 	}
 
 	histogram, err := _this.meter.Float64Histogram(
-		fmt.Sprintf("%s_%s_duration_seconds", serviceName, name),
+		fmt.Sprintf("%s_%s_duration_seconds", config.ServiceName, name),
 		metric.WithDescription("Duration of operation in seconds"),
 	)
 	if err != nil {

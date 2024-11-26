@@ -203,6 +203,8 @@ func (_this proxyController) handleRequest(reqCtx requestContext) {
 				reqCtx.ginContext.Header(k, v)
 			}
 		}
+		// Add a header indicating that this request was proxied
+		reqCtx.ginContext.Header("X-Proxied-By", config.ServiceName)
 		reqCtx.ginContext.Data(resp.StatusCode, resp.Header.Get("Content-Type"), respBody)
 	}
 }
