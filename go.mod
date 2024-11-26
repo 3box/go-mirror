@@ -1,6 +1,6 @@
 module github.com/3box/go-proxy
 
-go 1.22.8
+go 1.23
 
 require (
 	github.com/gin-gonic/gin v1.10.0
