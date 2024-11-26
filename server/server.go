@@ -15,10 +15,10 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/3box/go-mirror/common/config"
-	"github.com/3box/go-mirror/common/logging"
-	"github.com/3box/go-mirror/common/metric"
-	"github.com/3box/go-mirror/controllers"
+	"github.com/smrz2001/go-mirror/common/config"
+	"github.com/smrz2001/go-mirror/common/logging"
+	"github.com/smrz2001/go-mirror/common/metric"
+	"github.com/smrz2001/go-mirror/controllers"
 )
 
 type Server interface {

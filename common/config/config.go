@@ -5,7 +5,7 @@ import (
 
 	"github.com/spf13/viper"
 
-	"github.com/3box/go-mirror/common/logging"
+	"github.com/smrz2001/go-mirror/common/logging"
 )
 
 type Config struct {

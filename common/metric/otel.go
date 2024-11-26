@@ -15,7 +15,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/3box/go-mirror/common/logging"
+	"github.com/smrz2001/go-mirror/common/logging"
 )
 
 const serviceName = "go-mirror"

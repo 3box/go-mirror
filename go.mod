@@ -1,4 +1,4 @@
-module github.com/3box/go-mirror
+module github.com/smrz2001/go-mirror
 
 go 1.22.8
 

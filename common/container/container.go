@@ -5,11 +5,11 @@ import (
 
 	"go.uber.org/dig"
 
-	"github.com/3box/go-mirror/common/config"
-	"github.com/3box/go-mirror/common/logging"
-	"github.com/3box/go-mirror/common/metric"
-	"github.com/3box/go-mirror/controllers"
-	"github.com/3box/go-mirror/server"
+	"github.com/smrz2001/go-mirror/common/config"
+	"github.com/smrz2001/go-mirror/common/logging"
+	"github.com/smrz2001/go-mirror/common/metric"
+	"github.com/smrz2001/go-mirror/controllers"
+	"github.com/smrz2001/go-mirror/server"
 )
 
 func BuildContainer(ctx context.Context) (*dig.Container, error) {
