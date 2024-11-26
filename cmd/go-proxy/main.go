@@ -5,10 +5,10 @@ import (
 	"log"
 	"runtime"
 
-	"github.com/smrz2001/go-mirror/common/config"
-	"github.com/smrz2001/go-mirror/common/container"
-	"github.com/smrz2001/go-mirror/common/logging"
-	"github.com/smrz2001/go-mirror/server"
+	"github.com/3box/go-proxy/common/config"
+	"github.com/3box/go-proxy/common/container"
+	"github.com/3box/go-proxy/common/logging"
+	"github.com/3box/go-proxy/server"
 )
 
 func main() {

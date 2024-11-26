@@ -16,6 +16,7 @@ type MetricService interface {
 }
 
 const (
-	MetricProxyRequest  = "proxy_request"
-	MetricMirrorRequest = "mirror_request"
+	MetricProxyRequest   = "proxy_request"
+	MetricMirrorRequest  = "mirror_request"
+	MetricPanicRecovered = "panic_recovered"
 )

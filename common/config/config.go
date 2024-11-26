@@ -2,21 +2,38 @@ package config
 
 import (
 	"strings"
+	"time"
 
 	"github.com/spf13/viper"
 
-	"github.com/smrz2001/go-mirror/common/logging"
+	"github.com/3box/go-proxy/common/logging"
+)
+
+const (
+	defaultProxyListenPort   = "8080"
+	defaultMetricsListenPort = "9464"
+	defaultDialTimeout       = 30 * time.Second
+	defaultIdleTimeout       = 90 * time.Second
+	defaultMirrorTimeout     = 30 * time.Second
 )
 
 type Config struct {
-	Proxy ProxyConfig
+	Proxy   ProxyConfig
+	Metrics MetricsConfig
 }
 
 type ProxyConfig struct {
-	TargetURL  string
-	MirrorURL  string
-	ListenAddr string
-	TLSEnabled bool
+	TargetURL     string
+	MirrorURL     string
+	ListenPort    string
+	DialTimeout   time.Duration
+	IdleTimeout   time.Duration
+	MirrorTimeout time.Duration
+}
+
+type MetricsConfig struct {
+	Enabled    bool
+	ListenPort string
 }
 
 func LoadConfig(logger logging.Logger) (*Config, error) {
@@ -26,8 +43,14 @@ func LoadConfig(logger logging.Logger) (*Config, error) {
 		// This was necessary to get viper to recognize the nested struct fields
 		viper.EnvKeyReplacer(strings.NewReplacer(".", "_")),
 	)
-	v.SetEnvPrefix("GO_MIRROR")
+	v.SetEnvPrefix("GO_PROXY")
 	v.AutomaticEnv()
+
+	v.SetDefault("Proxy.ListenPort", defaultProxyListenPort)
+	v.SetDefault("Proxy.DialTimeout", defaultDialTimeout)
+	v.SetDefault("Proxy.IdleTimeout", defaultIdleTimeout)
+	v.SetDefault("Proxy.MirrorTimeout", defaultMirrorTimeout)
+	v.SetDefault("Metrics.ListenPort", defaultMetricsListenPort)
 
 	// Unmarshal environment variables into the config struct
 	var cfg Config

@@ -14,9 +14,9 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/smrz2001/go-mirror/common/config"
-	"github.com/smrz2001/go-mirror/common/logging"
-	"github.com/smrz2001/go-mirror/common/metric"
+	"github.com/3box/go-proxy/common/config"
+	"github.com/3box/go-proxy/common/logging"
+	"github.com/3box/go-proxy/common/metric"
 )
 
 type ProxyController interface {
@@ -34,6 +34,23 @@ type proxyController struct {
 	target    *url.URL
 	mirror    *url.URL
 	transport *http.Transport
+}
+
+type requestType string
+
+const (
+	proxyRequest  requestType = "proxy"
+	mirrorRequest             = "mirror"
+)
+
+// Create a struct to hold request context
+type requestContext struct {
+	reqType    requestType
+	ginContext *gin.Context
+	request    *http.Request
+	bodyBytes  []byte
+	startTime  time.Time
+	targetURL  *url.URL
 }
 
 func NewProxyController(
@@ -57,15 +74,10 @@ func NewProxyController(
 	transport := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
+			Timeout: cfg.Proxy.DialTimeout,
 		}).DialContext,
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   10,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
+		ForceAttemptHTTP2: true,
+		IdleConnTimeout:   cfg.Proxy.IdleTimeout,
 	}
 
 	return &proxyController{
@@ -87,149 +99,111 @@ func (_this proxyController) proxyRequest(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read request"})
 		return
 	}
+	// Ignore error since we are closing the body anyway
+	_ = c.Request.Body.Close()
 
-	// Close the original body
-	c.Request.Body.Close()
+	// Handle proxy request
+	_this.handleRequest(requestContext{
+		reqType:    proxyRequest,
+		ginContext: c,
+		request:    c.Request,
+		bodyBytes:  bodyBytes,
+		startTime:  time.Now(),
+		targetURL:  _this.target,
+	})
 
-	start := time.Now()
-
-	// Create the proxy request
-	proxyReq := c.Request.Clone(c.Request.Context())
-	proxyReq.URL.Scheme = _this.target.Scheme
-	proxyReq.URL.Host = _this.target.Host
-	proxyReq.Host = _this.target.Host
-	proxyReq.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-
-	// Log outbound request
-	_this.logger.Debugw("outbound request",
-		"method", proxyReq.Method,
-		"url", proxyReq.URL.String(),
-		"headers", proxyReq.Header,
-	)
-
-	// Record request with normalized path
-	err = _this.metrics.RecordRequest(_this.ctx, metric.MetricProxyRequest, proxyReq.Method, proxyReq.URL.Path)
-	if err != nil {
-		_this.logger.Errorw("failed to record proxy request metric", "error", err)
-	}
-
-	// Make the proxy request
-	resp, err := _this.transport.RoundTrip(proxyReq)
-	if err != nil {
-		_this.logger.Errorw("proxy error", "error", err)
-		c.JSON(http.StatusBadGateway, gin.H{"error": "proxy error"})
-		return
-	}
-	defer resp.Body.Close()
-
-	// Read the response body
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		_this.logger.Errorw("failed to read proxy response body", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read response"})
-		return
-	}
-
-	// Log response details
-	_this.logger.Debugw("received proxy response",
-		"status", resp.StatusCode,
-		"content_length", len(respBody),
-		"content_type", resp.Header.Get("Content-Type"),
-	)
-
-	attrs := []attribute.KeyValue{
-		attribute.String("method", proxyReq.Method),
-		attribute.String("path", proxyReq.URL.Path),
-		attribute.Int("status_code", resp.StatusCode),
-		// Group status codes into categories
-		attribute.String("status_class", fmt.Sprintf("%dxx", resp.StatusCode/100)),
-	}
-
-	err = _this.metrics.RecordDuration(_this.ctx, metric.MetricProxyRequest, time.Since(start), attrs...)
-	if err != nil {
-		_this.logger.Errorw("failed to record proxy request duration metric", "error", err)
-	}
-
-	// Send mirror request if configured
+	// Handle mirror request if configured
 	if _this.mirror != nil {
-		// Create a new context for the mirror request
-		mirrorReq := c.Request.Clone(_this.ctx)
-		go _this.mirrorRequest(mirrorReq, bodyBytes)
-	}
+		go func() {
+			ctx, cancel := context.WithTimeout(_this.ctx, _this.cfg.Proxy.MirrorTimeout)
+			defer cancel()
 
-	// Copy response headers
-	for k, vv := range resp.Header {
-		for _, v := range vv {
-			c.Header(k, v)
-		}
+			_this.handleRequest(requestContext{
+				reqType:   mirrorRequest,
+				request:   c.Request.Clone(ctx),
+				bodyBytes: bodyBytes,
+				startTime: time.Now(),
+				targetURL: _this.mirror,
+			})
+		}()
 	}
-
-	// Write the response
-	c.Data(resp.StatusCode, resp.Header.Get("Content-Type"), respBody)
 }
 
-func (_this proxyController) mirrorRequest(mirrorReq *http.Request, bodyBytes []byte) {
-	// Create a context with timeout for the mirror request
-	ctx, cancel := context.WithTimeout(_this.ctx, 30*time.Second)
-	defer cancel()
+func (_this proxyController) handleRequest(reqCtx requestContext) {
+	// Prepare the request
+	req := reqCtx.request.Clone(reqCtx.request.Context())
+	req.URL.Scheme = reqCtx.targetURL.Scheme
+	req.URL.Host = reqCtx.targetURL.Host
+	req.Host = reqCtx.targetURL.Host
+	req.Body = io.NopCloser(bytes.NewBuffer(reqCtx.bodyBytes))
 
-	// Use the new context
-	mirrorReq = mirrorReq.WithContext(ctx)
-
-	start := time.Now()
-
-	// Create the mirror request
-	mirrorReq.URL.Scheme = _this.mirror.Scheme
-	mirrorReq.URL.Host = _this.mirror.Host
-	mirrorReq.Host = _this.mirror.Host
-	mirrorReq.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-
-	// Log mirror request
-	_this.logger.Debugw("mirror request",
-		"method", mirrorReq.Method,
-		"url", mirrorReq.URL.String(),
-		"headers", mirrorReq.Header,
+	// Log outbound request
+	_this.logger.Debugw(fmt.Sprintf("%s request", reqCtx.reqType),
+		"method", req.Method,
+		"url", req.URL.String(),
+		"headers", req.Header,
 	)
 
-	// Record request with normalized path
-	err := _this.metrics.RecordRequest(_this.ctx, metric.MetricMirrorRequest, mirrorReq.Method, mirrorReq.URL.Path)
-	if err != nil {
-		_this.logger.Errorw("failed to record mirror request metric", "error", err)
+	// Record metrics
+	metricName := metric.MetricProxyRequest
+	if reqCtx.reqType == mirrorRequest {
+		metricName = metric.MetricMirrorRequest
 	}
 
-	// Make the mirror request
-	resp, err := _this.transport.RoundTrip(mirrorReq)
+	if err := _this.metrics.RecordRequest(_this.ctx, metricName, req.Method, req.URL.Path); err != nil {
+		_this.logger.Errorw("failed to record request metric", "error", err)
+	}
+
+	// Make the request
+	resp, err := _this.transport.RoundTrip(req)
 	if err != nil {
-		_this.logger.Errorw("mirror error", "error", err)
+		_this.logger.Errorw(fmt.Sprintf("%s error", reqCtx.reqType), "error", err)
+		if reqCtx.reqType == proxyRequest {
+			reqCtx.ginContext.JSON(http.StatusBadGateway, gin.H{"error": "proxy error"})
+		}
 		return
 	}
-	defer resp.Body.Close()
+	// Ignore error since we are closing the body anyway
+	defer func() { _ = resp.Body.Close() }()
 
-	// Read and log the mirror response
-	body, err := io.ReadAll(resp.Body)
+	// Process response
+	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		_this.logger.Errorw("failed to read mirror response", "error", err)
+		_this.logger.Errorw(fmt.Sprintf("failed to read %s response", reqCtx.reqType), "error", err)
+		if reqCtx.reqType == proxyRequest {
+			reqCtx.ginContext.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read response"})
+		}
 		return
 	}
 
-	// Log mirror response
-	_this.logger.Debugw("mirror response",
+	// Log response
+	_this.logger.Debugw(fmt.Sprintf("%s response", reqCtx.reqType),
 		"status", resp.StatusCode,
-		"content_length", len(body),
-		"content_type", resp.Header.Get("Content-Type"),
+		"content length", len(respBody),
+		"headers", resp.Header,
+		"latency", time.Since(reqCtx.startTime),
 	)
 
+	// Record metrics
 	attrs := []attribute.KeyValue{
-		attribute.String("method", mirrorReq.Method),
-		attribute.String("path", mirrorReq.URL.Path),
+		attribute.String("method", req.Method),
+		attribute.String("path", req.URL.Path),
 		attribute.Int("status_code", resp.StatusCode),
-		// Group status codes into categories
 		attribute.String("status_class", fmt.Sprintf("%dxx", resp.StatusCode/100)),
 	}
 
-	err = _this.metrics.RecordDuration(_this.ctx, metric.MetricMirrorRequest, time.Since(start), attrs...)
-	if err != nil {
-		_this.logger.Errorw("failed to record proxy request duration metric", "error", err)
+	if err := _this.metrics.RecordDuration(_this.ctx, metricName, time.Since(reqCtx.startTime), attrs...); err != nil {
+		_this.logger.Errorw("failed to record duration metric", "error", err)
+	}
+
+	// Write response for proxy requests only
+	if reqCtx.reqType == proxyRequest {
+		for k, vv := range resp.Header {
+			for _, v := range vv {
+				reqCtx.ginContext.Header(k, v)
+			}
+		}
+		reqCtx.ginContext.Data(resp.StatusCode, resp.Header.Get("Content-Type"), respBody)
 	}
 }
 

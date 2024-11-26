@@ -8,70 +8,92 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
-	"time"
+
+	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/smrz2001/go-mirror/common/config"
-	"github.com/smrz2001/go-mirror/common/logging"
-	"github.com/smrz2001/go-mirror/common/metric"
-	"github.com/smrz2001/go-mirror/controllers"
+	"github.com/3box/go-proxy/common/config"
+	"github.com/3box/go-proxy/common/logging"
+	"github.com/3box/go-proxy/common/metric"
+	"github.com/3box/go-proxy/controllers"
 )
 
 type Server interface {
 	Run()
 }
 
-// serverImpl is the struct that implements the server interface. It pulls together the individual implementations for
-// the different controllers.
 type serverImpl struct {
 	ctx             context.Context
+	serverCtx       context.Context
+	serverCtxCancel context.CancelFunc
 	cfg             *config.Config
 	logger          logging.Logger
-	server          *http.Server
+	proxyServer     *http.Server
+	metricsServer   *http.Server
 	proxyController controllers.ProxyController
-	metrics         metric.MetricService
+	metricService   metric.MetricService
+	wg              *sync.WaitGroup
 }
 
 func NewServer(
 	ctx context.Context,
 	cfg *config.Config,
 	logger logging.Logger,
-	metrics metric.MetricService,
+	metricService metric.MetricService,
 	proxyController controllers.ProxyController,
 ) (*gin.Engine, Server) {
 	router := gin.New()
 
+	// Set up a server context
+	serverCtx, serverCtxCancel := context.WithCancel(ctx)
+
 	server := &serverImpl{
-		ctx:    ctx,
-		cfg:    cfg,
-		logger: logger,
-		server: &http.Server{
+		ctx:             ctx,
+		serverCtx:       serverCtx,
+		serverCtxCancel: serverCtxCancel,
+		cfg:             cfg,
+		logger:          logger,
+		proxyServer: &http.Server{
 			Handler: router,
-			Addr:    cfg.Proxy.ListenAddr,
+			Addr:    ":" + cfg.Proxy.ListenPort,
+			BaseContext: func(net.Listener) context.Context {
+				return serverCtx
+			},
+		},
+		metricsServer: &http.Server{
+			Handler: router,
+			Addr:    ":" + cfg.Metrics.ListenPort,
 		},
 		proxyController: proxyController,
-		metrics:         metrics,
+		metricService:   metricService,
+		wg:              &sync.WaitGroup{},
 	}
 
+	// Add the panic recovery middleware before any routes
+	router.Use(server.panicHandler())
+
 	// Match all paths including root
-	router.Any("/*path", server.handleProxy)
+	router.Any("/*path", server.router)
 
 	return router, server
 }
 
-func (_this serverImpl) handleProxy(c *gin.Context) {
-	if strings.HasPrefix(c.Request.URL.Path, "/metrics") {
-		_this.metrics.GetPrometheusHandler()(c)
-		return
-	}
-
+func (_this serverImpl) router(c *gin.Context) {
 	switch c.Request.Method {
 	case http.MethodGet:
-		_this.proxyController.ProxyGetRequest(c)
+		{
+			if strings.HasPrefix(c.Request.URL.Path, "/metrics") {
+				_this.metricService.GetPrometheusHandler()(c)
+				return
+			}
+
+			_this.proxyController.ProxyGetRequest(c)
+		}
 	case http.MethodPost:
 		_this.proxyController.ProxyPostRequest(c)
 	case http.MethodPut:
@@ -84,59 +106,112 @@ func (_this serverImpl) handleProxy(c *gin.Context) {
 }
 
 func (_this serverImpl) Run() {
-	// Set up a server context
-	serverCtx, serverCtxCancel := context.WithCancel(_this.ctx)
-	_this.server.BaseContext = func(net.Listener) context.Context {
-		return serverCtx
-	}
-
-	wg := sync.WaitGroup{}
-	wg.Add(2)
-
 	// Start the proxy server
-	go func() {
-		defer wg.Done()
+	_this.runProxyServer()
 
-		_this.logger.Infof("server: proxy server starting on %s", _this.server.Addr)
-		err := _this.server.ListenAndServe()
+	// Start the metrics server
+	_this.runMetricsServer()
+
+	// Graceful shutdown
+	_this.gracefulShutdown()
+
+	// Wait for goroutines to finish
+	_this.wg.Wait()
+}
+
+func (_this serverImpl) runProxyServer() {
+	_this.wg.Add(1)
+	go func() {
+		defer _this.wg.Done()
+
+		_this.logger.Infof("server: proxy server starting on %s", _this.proxyServer.Addr)
+		err := _this.proxyServer.ListenAndServe()
 
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			_this.logger.Fatalf("proxy server listen error: %s", err)
 		}
 	}()
+}
 
-	// Graceful shutdown
+func (_this serverImpl) runMetricsServer() {
+	_this.wg.Add(1)
 	go func() {
-		defer wg.Done()
+		defer _this.wg.Done()
+
+		_this.logger.Infof("server: metrics server starting on %s", _this.metricsServer.Addr)
+		err := _this.metricsServer.ListenAndServe()
+
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			_this.logger.Fatalf("metrics server listen error: %s", err)
+		}
+	}()
+}
+
+func (_this serverImpl) gracefulShutdown() {
+	_this.wg.Add(1)
+	go func() {
+		defer _this.wg.Done()
 
 		// Wait for interrupt signal to gracefully shutdown the server
 		quit := make(chan os.Signal, 1)
 		signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT, syscall.SIGQUIT, syscall.SIGHUP)
 		<-quit
 
-		serverCtxCancel()
+		_this.serverCtxCancel()
 		_this.logger.Infof("server: shutdown started...")
 
-		// Let shutdown take as long the parent context allows
-		if err := _this.Stop(); err != nil {
-			_this.logger.Fatalf("server: shutdown error: %s", err)
+		if errs := _this.shutdownServers(); errs != nil {
+			_this.logger.Fatalf("server: shutdown error(s): %v", errs)
 		}
 
 		_this.logger.Infof("server: shutdown complete")
 		_ = _this.logger.Sync()
 	}()
-
-	// Wait for both goroutines to finish
-	wg.Wait()
 }
 
-func (_this serverImpl) Stop() error {
-	ctx, cancel := context.WithTimeout(_this.ctx, 5*time.Second)
-	defer cancel()
-
-	if err := _this.server.Shutdown(ctx); err != nil {
-		return fmt.Errorf("proxy server shutdown error: %w", err)
+func (_this serverImpl) shutdownServers() (errs []error) {
+	// Let shutdown take as long the parent context allows
+	if err := _this.proxyServer.Shutdown(_this.ctx); err != nil {
+		errs = append(errs, fmt.Errorf("proxy server shutdown error: %w", err))
 	}
+	if err := _this.metricsServer.Shutdown(_this.ctx); err != nil {
+		errs = append(errs, fmt.Errorf("metrics server shutdown error: %w", err))
+	}
+	return errs
+}
 
-	return nil
+func (_this serverImpl) panicHandler() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		defer func() {
+			if err := recover(); err != nil {
+				// Record panic metric
+				attrs := []attribute.KeyValue{
+					attribute.String("method", c.Request.Method),
+					attribute.String("path", c.Request.URL.Path),
+					attribute.String("error", fmt.Sprintf("%v", err)),
+				}
+
+				if recordErr := _this.metricService.RecordRequest(_this.ctx, metric.MetricPanicRecovered, c.Request.Method, c.Request.URL.Path, attrs...); recordErr != nil {
+					_this.logger.Errorw("failed to record panic metric", "error", recordErr)
+				}
+
+				// Log the panic with stack trace
+				stack := make([]byte, 4096)
+				stack = stack[:runtime.Stack(stack, false)]
+				_this.logger.Errorw("panic recovered",
+					"error", err,
+					"method", c.Request.Method,
+					"path", c.Request.URL.Path,
+					"stack", string(stack),
+				)
+
+				c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
+					"error": "internal server error",
+				})
+			}
+		}()
+
+		// Process request
+		c.Next()
+	}
 }
