@@ -18,7 +18,7 @@ import (
 	"github.com/3box/go-proxy/common/logging"
 )
 
-const serviceName = "go-mirror"
+const serviceName = "go-proxy"
 
 var _ MetricService = &otelMetricService{}
 
@@ -80,7 +80,7 @@ func (_this otelMetricService) RecordRequest(ctx context.Context, name, method, 
 	normalizedPath := normalizePath(path)
 
 	counter, err := _this.meter.Int64Counter(
-		fmt.Sprintf("%s_requests_total", name),
+		fmt.Sprintf("%s_%s_requests_total", serviceName, name),
 		metric.WithDescription("Total number of requests received"),
 	)
 	if err != nil {
@@ -107,7 +107,7 @@ func (_this otelMetricService) RecordDuration(ctx context.Context, name string, 
 	}
 
 	histogram, err := _this.meter.Float64Histogram(
-		fmt.Sprintf("%s_duration_seconds", name),
+		fmt.Sprintf("%s_%s_duration_seconds", serviceName, name),
 		metric.WithDescription("Duration of operation in seconds"),
 	)
 	if err != nil {
