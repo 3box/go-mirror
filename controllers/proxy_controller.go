@@ -224,6 +224,8 @@ func (_this proxyController) handleRequest(reqCtx requestContext) {
 
 	// Log response
 	_this.logger.Debugw(fmt.Sprintf("%s response", reqCtx.reqType),
+		"method", req.Method,
+		"url", req.URL.String(),
 		"status", resp.StatusCode,
 		"content length", len(respBody),
 		"headers", resp.Header,
