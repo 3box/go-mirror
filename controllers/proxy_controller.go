@@ -108,18 +108,14 @@ func (_this proxyController) createRequest(
 
 	// Copy headers from original request
 	for k, vv := range originalReq.Header {
-		for _, v := range vv {
-			newReq.Header.Add(k, v)
+		if k != "Content-Length" { // Skip Content-Length as it will be set automatically
+			newReq.Header[k] = vv
 		}
 	}
 
-	// Add Content-Length header if body exists
+	// Set Content-Length once
 	if len(bodyBytes) > 0 {
-		newReq.Header.Add("Content-Length", fmt.Sprintf("%d", len(bodyBytes)))
-		// Ensure content type is preserved
-		if contentType := originalReq.Header.Get("Content-Type"); contentType != "" {
-			newReq.Header.Set("Content-Type", contentType)
-		}
+		newReq.ContentLength = int64(len(bodyBytes))
 	}
 
 	return newReq, nil
