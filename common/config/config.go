@@ -15,8 +15,7 @@ const (
 	defaultProxyListenPort   = "8080"
 	defaultMetricsListenPort = "9464"
 	defaultDialTimeout       = 30 * time.Second
-	defaultIdleTimeout       = 90 * time.Second
-	defaultMirrorTimeout     = 30 * time.Second
+	defaultTimeout           = 120 * time.Second
 )
 
 type Config struct {
@@ -25,12 +24,11 @@ type Config struct {
 }
 
 type ProxyConfig struct {
-	TargetURL     string
-	MirrorURL     string
-	ListenPort    string
-	DialTimeout   time.Duration
-	IdleTimeout   time.Duration
-	MirrorTimeout time.Duration
+	TargetURL   string
+	MirrorURL   string
+	ListenPort  string
+	DialTimeout time.Duration
+	Timeout     time.Duration
 }
 
 type MetricsConfig struct {
@@ -50,8 +48,7 @@ func LoadConfig(logger logging.Logger) (*Config, error) {
 
 	v.SetDefault("Proxy.ListenPort", defaultProxyListenPort)
 	v.SetDefault("Proxy.DialTimeout", defaultDialTimeout)
-	v.SetDefault("Proxy.IdleTimeout", defaultIdleTimeout)
-	v.SetDefault("Proxy.MirrorTimeout", defaultMirrorTimeout)
+	v.SetDefault("Proxy.Timeout", defaultTimeout)
 	v.SetDefault("Metrics.ListenPort", defaultMetricsListenPort)
 
 	// Unmarshal environment variables into the config struct

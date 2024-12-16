@@ -5,8 +5,10 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
+	"sync/atomic"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -24,23 +26,25 @@ type ProxyController interface {
 	ProxyGetRequest(c *gin.Context)
 	ProxyPutRequest(c *gin.Context)
 	ProxyDeleteRequest(c *gin.Context)
+	ProxyOptionsRequest(c *gin.Context)
 }
 
 type proxyController struct {
-	ctx     context.Context
-	cfg     *config.Config
-	logger  logging.Logger
-	metrics metric.MetricService
-	target  *url.URL
-	mirror  *url.URL
-	client  *http.Client
+	ctx         context.Context
+	cfg         *config.Config
+	logger      logging.Logger
+	metrics     metric.MetricService
+	target      *url.URL
+	mirror      *url.URL
+	client      *http.Client
+	activeConns *int64
 }
 
 type requestType string
 
 const (
 	proxyRequest  requestType = "proxy"
-	mirrorRequest             = "mirror"
+	mirrorRequest requestType = "mirror"
 )
 
 // Create a struct to hold request context
@@ -72,27 +76,38 @@ func NewProxyController(
 		}
 	}
 
-	client := &http.Client{
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 10 {
-				return fmt.Errorf("stopped after 10 redirects")
+	pc := &proxyController{
+		ctx:         ctx,
+		cfg:         cfg,
+		logger:      logger,
+		metrics:     metrics,
+		target:      target,
+		mirror:      mirror,
+		activeConns: new(int64),
+	}
+
+	transport := &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 100,
+		DisableKeepAlives:   false,
+		DisableCompression:  true,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialer := &net.Dialer{
+				Timeout: cfg.Proxy.DialTimeout,
 			}
-			return nil
+			return dialer.DialContext(ctx, network, addr)
 		},
 	}
 
-	return &proxyController{
-		ctx:     ctx,
-		cfg:     cfg,
-		logger:  logger,
-		metrics: metrics,
-		target:  target,
-		mirror:  mirror,
-		client:  client,
+	pc.client = &http.Client{
+		Transport: transport,
+		Timeout:   cfg.Proxy.Timeout,
 	}
+
+	return pc
 }
 
-func (_this proxyController) proxyRequest(c *gin.Context) {
+func (_this *proxyController) proxyAndMirrorRequest(c *gin.Context) {
 	// Generate or get trace ID
 	traceID := c.GetHeader("X-Trace-ID")
 	if traceID == "" {
@@ -114,121 +129,53 @@ func (_this proxyController) proxyRequest(c *gin.Context) {
 	// Restore the request body for downstream middleware/handlers
 	c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 
-	// Create proxy request
-	proxyReq, err := _this.createRequest(c.Request.Context(), c.Request, bodyBytes, traceID)
-	if err != nil {
-		_this.logger.Errorw("failed to create proxy request",
-			"error", err,
-			"trace_id", traceID,
-		)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create request"})
-		return
+	_this.processRequest(c, proxyRequest, bodyBytes, _this.target, traceID)
+	if _this.mirror != nil {
+		go _this.processRequest(c, mirrorRequest, bodyBytes, _this.mirror, traceID)
+	}
+}
+
+func (_this *proxyController) processRequest(
+	c *gin.Context,
+	reqType requestType,
+	bodyBytes []byte,
+	targetURL *url.URL,
+	traceID string,
+) {
+	req := c.Request.Clone(c.Request.Context())
+	req.URL.Scheme = targetURL.Scheme
+	req.URL.Host = targetURL.Host
+	req.Host = targetURL.Host
+	req.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+	req.Header.Set("X-Trace-ID", traceID)
+
+	if len(bodyBytes) > 0 {
+		req.ContentLength = int64(len(bodyBytes))
 	}
 
-	// Handle proxy request
-	_this.handleRequest(requestContext{
-		reqType:    proxyRequest,
+	_this.sendRequest(requestContext{
+		reqType:    reqType,
 		ginContext: c,
-		request:    proxyReq,
+		request:    req,
 		bodyBytes:  bodyBytes,
 		startTime:  time.Now(),
-		targetURL:  _this.target,
+		targetURL:  targetURL,
 		traceID:    traceID,
 	})
-
-	// Handle mirror request if configured
-	if _this.mirror != nil {
-		go func() {
-			ctx, cancel := context.WithTimeout(_this.ctx, _this.cfg.Proxy.MirrorTimeout)
-			defer cancel()
-
-			mirrorReq, err := _this.createRequest(ctx, c.Request, bodyBytes, traceID)
-			if err != nil {
-				_this.logger.Errorw("failed to create mirror request",
-					"error", err,
-					"trace_id", traceID,
-				)
-				return
-			}
-
-			_this.handleRequest(requestContext{
-				reqType:   mirrorRequest,
-				request:   mirrorReq,
-				bodyBytes: bodyBytes,
-				startTime: time.Now(),
-				targetURL: _this.mirror,
-				traceID:   traceID,
-			})
-		}()
-	}
 }
 
-func (_this proxyController) createRequest(
-	ctx context.Context,
-	originalReq *http.Request,
-	bodyBytes []byte,
-	traceID string,
-) (*http.Request, error) {
-	// Create new request with appropriate context
-	newReq, err := http.NewRequestWithContext(
-		ctx,
-		originalReq.Method,
-		originalReq.URL.String(),
-		bytes.NewBuffer(bodyBytes),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	// Copy headers from original request
-	for k, vv := range originalReq.Header {
-		if k != "Content-Length" { // Skip Content-Length as it will be set automatically
-			newReq.Header[k] = vv
-		}
-	}
-
-	// Add trace ID header
-	newReq.Header.Set("X-Trace-ID", traceID)
-
-	// Set Content-Length once
-	if len(bodyBytes) > 0 {
-		newReq.ContentLength = int64(len(bodyBytes))
-	}
-
-	return newReq, nil
-}
-
-func (_this proxyController) handleRequest(reqCtx requestContext) {
-	// Prepare the request
-	req := reqCtx.request
-	req.URL.Scheme = reqCtx.targetURL.Scheme
-	req.URL.Host = reqCtx.targetURL.Host
-	req.Host = reqCtx.targetURL.Host
-	req.Body = io.NopCloser(bytes.NewBuffer(reqCtx.bodyBytes))
-
-	// Log outbound request
-	_this.logger.Debugw(fmt.Sprintf("%s request", reqCtx.reqType),
-		"method", req.Method,
-		"url", req.URL.String(),
-		"headers", req.Header,
-		"trace_id", reqCtx.traceID,
-	)
-
-	// Record metrics
+func (_this *proxyController) sendRequest(reqCtx requestContext) {
+	// Set metric name based on request type
 	metricName := metric.MetricProxyRequest
 	if reqCtx.reqType == mirrorRequest {
 		metricName = metric.MetricMirrorRequest
 	}
 
-	if err := _this.metrics.RecordRequest(_this.ctx, metricName, req.Method, req.URL.Path); err != nil {
-		_this.logger.Errorw("failed to record request metric",
-			"error", err,
-			"trace_id", reqCtx.traceID,
-		)
-	}
-
+	atomic.AddInt64(_this.activeConns, 1)
 	// Make the request
-	resp, err := _this.client.Do(req)
+	resp, err := _this.client.Do(reqCtx.request)
+	atomic.AddInt64(_this.activeConns, -1)
+
 	if err != nil {
 		_this.logger.Errorw(fmt.Sprintf("%s error", reqCtx.reqType),
 			"error", err,
@@ -242,69 +189,51 @@ func (_this proxyController) handleRequest(reqCtx requestContext) {
 	// Ignore error since we are closing the body anyway
 	defer func() { _ = resp.Body.Close() }()
 
-	// Process response
+	// Record status metrics with the appropriate prefix
+	statusClass := fmt.Sprintf("%dxx", resp.StatusCode/100)
+	_ = _this.metrics.RecordRequest(
+		_this.ctx,
+		fmt.Sprintf("%s_status", metricName),
+		statusClass,
+		reqCtx.request.URL.Path,
+		attribute.String("status_class", statusClass),
+		attribute.Int("status_code", resp.StatusCode),
+		attribute.String("method", reqCtx.request.Method),
+	)
+
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		_this.logger.Errorw(fmt.Sprintf("failed to read %s response", reqCtx.reqType), "error", err)
+		_this.logger.Errorw(fmt.Sprintf("failed to read %s response", reqCtx.reqType),
+			"error", err,
+			"trace_id", reqCtx.traceID,
+		)
 		if reqCtx.reqType == proxyRequest {
 			reqCtx.ginContext.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read response"})
 		}
 		return
 	}
 
-	// Record metrics
-	attrs := []attribute.KeyValue{
-		attribute.String("method", req.Method),
-		attribute.String("path", req.URL.Path),
-		attribute.Int("status_code", resp.StatusCode),
-		attribute.String("status_class", fmt.Sprintf("%dxx", resp.StatusCode/100)),
-	}
-
-	if err := _this.metrics.RecordDuration(_this.ctx, metricName, time.Since(reqCtx.startTime), attrs...); err != nil {
-		_this.logger.Errorw("failed to record duration metric", "error", err)
-	}
-
-	// Write response for proxy requests only
 	if reqCtx.reqType == proxyRequest {
 		for k, vv := range resp.Header {
 			for _, v := range vv {
 				reqCtx.ginContext.Header(k, v)
 			}
 		}
-		// Add a header indicating that this request was proxied
 		reqCtx.ginContext.Header("X-Proxied-By", config.ServiceName)
 		reqCtx.ginContext.Header("X-Trace-ID", reqCtx.traceID)
 		reqCtx.ginContext.Data(resp.StatusCode, resp.Header.Get("Content-Type"), respBody)
 	}
 
-	// Log response with trace ID
-	_this.logger.Debugw(fmt.Sprintf("%s response", reqCtx.reqType),
-		"method", req.Method,
-		"url", req.URL.String(),
-		"status", resp.StatusCode,
-		"content length", len(respBody),
-		"headers", resp.Header,
-		"latency", time.Since(reqCtx.startTime),
-		"trace_id", reqCtx.traceID,
+	// Record duration with the same metric name prefix
+	_ = _this.metrics.RecordDuration(_this.ctx, metricName, time.Since(reqCtx.startTime),
+		attribute.String("method", reqCtx.request.Method),
+		attribute.String("path", reqCtx.request.URL.Path),
+		attribute.Int("status_code", resp.StatusCode),
 	)
 }
 
-// ProxyGetRequest handles GET requests
-func (_this proxyController) ProxyGetRequest(c *gin.Context) {
-	_this.proxyRequest(c)
-}
-
-// ProxyPostRequest handles POST requests
-func (_this proxyController) ProxyPostRequest(c *gin.Context) {
-	_this.proxyRequest(c)
-}
-
-// ProxyPutRequest handles PUT requests
-func (_this proxyController) ProxyPutRequest(c *gin.Context) {
-	_this.proxyRequest(c)
-}
-
-// ProxyDeleteRequest handles DELETE requests
-func (_this proxyController) ProxyDeleteRequest(c *gin.Context) {
-	_this.proxyRequest(c)
-}
+func (_this *proxyController) ProxyGetRequest(c *gin.Context)     { _this.proxyAndMirrorRequest(c) }
+func (_this *proxyController) ProxyPostRequest(c *gin.Context)    { _this.proxyAndMirrorRequest(c) }
+func (_this *proxyController) ProxyPutRequest(c *gin.Context)     { _this.proxyAndMirrorRequest(c) }
+func (_this *proxyController) ProxyDeleteRequest(c *gin.Context)  { _this.proxyAndMirrorRequest(c) }
+func (_this *proxyController) ProxyOptionsRequest(c *gin.Context) { _this.proxyAndMirrorRequest(c) }

@@ -100,6 +100,8 @@ func (_this serverImpl) router(c *gin.Context) {
 		_this.proxyController.ProxyPutRequest(c)
 	case http.MethodDelete:
 		_this.proxyController.ProxyDeleteRequest(c)
+	case http.MethodOptions:
+		_this.proxyController.ProxyOptionsRequest(c)
 	default:
 		c.Status(http.StatusMethodNotAllowed)
 	}

@@ -48,7 +48,7 @@ func NewOTelMetricService() (MetricService, error) {
 	}, nil
 }
 
-func (_this otelMetricService) GetPrometheusHandler() gin.HandlerFunc {
+func (_this *otelMetricService) GetPrometheusHandler() gin.HandlerFunc {
 	return gin.WrapH(promhttp.Handler())
 }
 
@@ -74,7 +74,7 @@ func normalizePath(path string) string {
 	}
 }
 
-func (_this otelMetricService) RecordRequest(ctx context.Context, name, method, path string, attrs ...attribute.KeyValue) error {
+func (_this *otelMetricService) RecordRequest(ctx context.Context, name, method, path string, attrs ...attribute.KeyValue) error {
 	// Normalize the path before recording metrics
 	normalizedPath := normalizePath(path)
 
@@ -94,7 +94,7 @@ func (_this otelMetricService) RecordRequest(ctx context.Context, name, method, 
 	return nil
 }
 
-func (_this otelMetricService) RecordDuration(ctx context.Context, name string, duration time.Duration, attrs ...attribute.KeyValue) error {
+func (_this *otelMetricService) RecordDuration(ctx context.Context, name string, duration time.Duration, attrs ...attribute.KeyValue) error {
 	// Find and normalize any path attributes
 	normalizedAttrs := make([]attribute.KeyValue, len(attrs))
 	for i, attr := range attrs {
