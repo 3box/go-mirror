@@ -228,7 +228,6 @@ func (_this *proxyController) sendRequest(reqCtx requestContext) {
 			metricName,
 			req.Method,
 			req.URL.Path,
-			attribute.String("method", req.Method),
 		)
 		_ = _this.metrics.RecordRequest(
 			_this.ctx,
@@ -237,14 +236,13 @@ func (_this *proxyController) sendRequest(reqCtx requestContext) {
 			req.URL.Path,
 			attribute.String("status_class", statusClass),
 			attribute.Int("status_code", statusCode),
-			attribute.String("method", req.Method),
 		)
 		_ = _this.metrics.RecordDuration(
 			_this.ctx,
 			metricName,
+			req.Method,
+			req.URL.Path,
 			latency,
-			attribute.String("method", req.Method),
-			attribute.String("path", req.URL.Path),
 			attribute.Int("status_code", statusCode),
 		)
 

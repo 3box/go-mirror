@@ -98,16 +98,9 @@ func (_this *otelMetricService) RecordRequest(ctx context.Context, name, method,
 	return nil
 }
 
-func (_this *otelMetricService) RecordDuration(ctx context.Context, name string, duration time.Duration, attrs ...attribute.KeyValue) error {
-	// Find and normalize any path attributes
-	normalizedAttrs := make([]attribute.KeyValue, len(attrs))
-	for i, attr := range attrs {
-		if attr.Key == "path" {
-			normalizedAttrs[i] = attribute.String("path", normalizePath(attr.Value.AsString()))
-		} else {
-			normalizedAttrs[i] = attr
-		}
-	}
+func (_this *otelMetricService) RecordDuration(ctx context.Context, name, method, path string, duration time.Duration, attrs ...attribute.KeyValue) error {
+	// Normalize the path before recording metrics
+	normalizedPath := normalizePath(path)
 
 	histogram, err := _this.meter.Float64Histogram(
 		fmt.Sprintf("%s_%s_duration_seconds", config.ServiceName, name),
@@ -117,7 +110,11 @@ func (_this *otelMetricService) RecordDuration(ctx context.Context, name string,
 		return err
 	}
 
-	histogram.Record(ctx, duration.Seconds(), metric.WithAttributes(normalizedAttrs...))
+	defaultAttrs := []attribute.KeyValue{
+		attribute.String("method", method),
+		attribute.String("path", normalizedPath), // Use normalized path
+	}
+	histogram.Record(ctx, duration.Seconds(), metric.WithAttributes(append(defaultAttrs, attrs...)...))
 	return nil
 }
 
