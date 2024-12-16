@@ -210,7 +210,11 @@ func (_this *proxyController) sendRequest(reqCtx requestContext) {
 	if err != nil {
 		_this.logger.Errorw(fmt.Sprintf("%s error", reqCtx.reqType),
 			"error", err,
+			"method", req.Method,
+			"url", req.URL.String(),
+			"headers", req.Header,
 			"trace_id", reqCtx.traceID,
+			"latency", time.Since(reqCtx.startTime),
 		)
 		if reqCtx.reqType == proxyRequest {
 			reqCtx.ginContext.JSON(http.StatusBadGateway, gin.H{"error": "proxy error"})
@@ -227,8 +231,8 @@ func (_this *proxyController) sendRequest(reqCtx requestContext) {
 		"status", resp.StatusCode,
 		"content length", resp.ContentLength,
 		"headers", resp.Header,
-		"latency", time.Since(reqCtx.startTime),
 		"trace_id", reqCtx.traceID,
+		"latency", time.Since(reqCtx.startTime),
 	)
 
 	// Record status metrics with the appropriate prefix
