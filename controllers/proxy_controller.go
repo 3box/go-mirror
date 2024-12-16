@@ -144,6 +144,18 @@ func (_this *proxyController) processRequest(
 	targetURL *url.URL,
 	traceID string,
 ) {
+	// Create appropriate context based on request type
+	var reqContext context.Context
+	if reqType == mirrorRequest {
+		// For mirror requests, use controller context with timeout.
+		var cancel context.CancelFunc
+		reqContext, cancel = context.WithTimeout(_this.ctx, _this.cfg.Proxy.Timeout)
+		defer cancel()
+	} else {
+		// For proxy requests, use the gin context
+		reqContext = c.Request.Context()
+	}
+
 	// Instead of cloning, create a new request.
 	targetPath := c.Request.URL.Path
 	if c.Request.URL.RawQuery != "" {
@@ -151,7 +163,7 @@ func (_this *proxyController) processRequest(
 	}
 
 	req, err := http.NewRequestWithContext(
-		c.Request.Context(),
+		reqContext,
 		c.Request.Method,
 		targetURL.String()+targetPath,
 		bytes.NewBuffer(bodyBytes),
