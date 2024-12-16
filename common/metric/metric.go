@@ -17,9 +17,14 @@ type MetricService interface {
 }
 
 const (
-	MetricProxyRequest            = "proxy_request"
-	MetricMirrorRequest           = "mirror_request"
-	MetricPanicRecovered          = "panic_recovered"
-	MetricProxyActiveConnections  = "proxy_active_connections"
-	MetricMirrorActiveConnections = "mirror_active_connections"
+	// Core proxy/mirror operation metrics
+	MetricProxy  = "proxy"  // Base metric for proxy operations
+	MetricMirror = "mirror" // Base metric for mirror operations
+
+	// Connection tracking metrics
+	MetricProxyConnections  = "proxy_connections"  // For active proxy connections
+	MetricMirrorConnections = "mirror_connections" // For active mirror connections
+
+	// System metrics
+	MetricPanics = "panics" // For system panic tracking
 )

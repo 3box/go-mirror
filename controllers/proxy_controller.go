@@ -190,26 +190,85 @@ func (_this *proxyController) processRequest(
 func (_this *proxyController) sendRequest(reqCtx requestContext) {
 	req := reqCtx.request
 	reqType := reqCtx.reqType
+	startTime := time.Now()
 
 	// Set metric name based on request type
-	metricName := metric.MetricProxyRequest
+	metricName := metric.MetricProxy
 	connsCounter := _this.proxyActiveConns
-
 	if reqType == mirrorRequest {
-		metricName = metric.MetricMirrorRequest
+		metricName = metric.MetricMirror
 		connsCounter = _this.mirrorActiveConns
 	}
 
+	// Track connections
 	atomic.AddInt64(connsCounter, 1)
 	_this.recordActiveConnections(reqType)
-
-	// Make the request
-	resp, err := _this.client.Do(req)
-
-	// Ensure we always decrement the counter when the function exits
 	defer func() {
 		atomic.AddInt64(connsCounter, -1)
 		_this.recordActiveConnections(reqType)
+	}()
+
+	// Always record metrics and log response
+	var resp *http.Response
+	var err error
+	var respBody []byte
+	defer func() {
+		statusCode := http.StatusBadGateway // Default error status
+		statusClass := "5xx"
+		latency := time.Since(startTime)
+
+		if err == nil {
+			statusCode = resp.StatusCode
+			statusClass = fmt.Sprintf("%dxx", resp.StatusCode/100)
+		}
+
+		// Record all metrics
+		_ = _this.metrics.RecordRequest(
+			_this.ctx,
+			metricName,
+			req.Method,
+			req.URL.Path,
+			attribute.String("method", req.Method),
+		)
+		_ = _this.metrics.RecordRequest(
+			_this.ctx,
+			metricName,
+			req.Method,
+			req.URL.Path,
+			attribute.String("status_class", statusClass),
+			attribute.Int("status_code", statusCode),
+			attribute.String("method", req.Method),
+		)
+		_ = _this.metrics.RecordDuration(
+			_this.ctx,
+			metricName,
+			latency,
+			attribute.String("method", req.Method),
+			attribute.String("path", req.URL.Path),
+			attribute.Int("status_code", statusCode),
+		)
+
+		// Log response or error
+		if err != nil {
+			_this.logger.Errorw(fmt.Sprintf("%s error", reqType),
+				"error", err,
+				"method", req.Method,
+				"url", req.URL.String(),
+				"headers", req.Header,
+				"trace_id", reqCtx.traceID,
+				"latency", latency,
+			)
+		} else {
+			_this.logger.Debugw(fmt.Sprintf("%s response", reqType),
+				"method", req.Method,
+				"url", req.URL.String(),
+				"status", statusCode,
+				"content_length", resp.ContentLength,
+				"headers", resp.Header,
+				"trace_id", reqCtx.traceID,
+				"latency", latency,
+			)
+		}
 	}()
 
 	// Log outbound request
@@ -220,83 +279,43 @@ func (_this *proxyController) sendRequest(reqCtx requestContext) {
 		"trace_id", reqCtx.traceID,
 	)
 
+	// Make the request
+	resp, err = _this.client.Do(req)
 	if err != nil {
-		_this.logger.Errorw(fmt.Sprintf("%s error", reqType),
-			"error", err,
-			"method", req.Method,
-			"url", req.URL.String(),
-			"headers", req.Header,
-			"trace_id", reqCtx.traceID,
-			"latency", time.Since(reqCtx.startTime),
-		)
 		if reqType == proxyRequest {
 			reqCtx.ginContext.JSON(http.StatusBadGateway, gin.H{"error": "proxy error"})
 		}
 		return
 	}
-	// Ignore error since we are closing the body anyway
-	defer func() { _ = resp.Body.Close() }()
+	defer resp.Body.Close()
 
-	// Log response
-	_this.logger.Debugw(fmt.Sprintf("%s response", reqType),
-		"method", req.Method,
-		"url", req.URL.String(),
-		"status", resp.StatusCode,
-		"content length", resp.ContentLength,
-		"headers", resp.Header,
-		"trace_id", reqCtx.traceID,
-		"latency", time.Since(reqCtx.startTime),
-	)
-
-	// Record status metrics with the appropriate prefix
-	statusClass := fmt.Sprintf("%dxx", resp.StatusCode/100)
-	_ = _this.metrics.RecordRequest(
-		_this.ctx,
-		fmt.Sprintf("%s_status", metricName),
-		statusClass,
-		req.URL.Path,
-		attribute.String("status_class", statusClass),
-		attribute.Int("status_code", resp.StatusCode),
-		attribute.String("method", req.Method),
-	)
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		_this.logger.Errorw(fmt.Sprintf("failed to read %s response", reqType),
-			"error", err,
-			"trace_id", reqCtx.traceID,
-		)
-		if reqType == proxyRequest {
-			reqCtx.ginContext.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read response"})
-		}
+	// For mirror requests, we're done here
+	if reqType == mirrorRequest {
 		return
 	}
 
-	if reqType == proxyRequest {
-		for k, vv := range resp.Header {
-			for _, v := range vv {
-				reqCtx.ginContext.Header(k, v)
-			}
-		}
-		reqCtx.ginContext.Header("X-Proxied-By", config.ServiceName)
-		reqCtx.ginContext.Header("X-Trace-ID", reqCtx.traceID)
-		reqCtx.ginContext.Data(resp.StatusCode, resp.Header.Get("Content-Type"), respBody)
+	respBody, err = io.ReadAll(resp.Body)
+	if err != nil {
+		reqCtx.ginContext.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read response"})
+		return
 	}
 
-	// Record duration with the same metric name prefix
-	_ = _this.metrics.RecordDuration(_this.ctx, metricName, time.Since(reqCtx.startTime),
-		attribute.String("method", req.Method),
-		attribute.String("path", req.URL.Path),
-		attribute.Int("status_code", resp.StatusCode),
-	)
+	for k, vv := range resp.Header {
+		for _, v := range vv {
+			reqCtx.ginContext.Header(k, v)
+		}
+	}
+	reqCtx.ginContext.Header("X-Proxied-By", config.ServiceName)
+	reqCtx.ginContext.Header("X-Trace-ID", reqCtx.traceID)
+	reqCtx.ginContext.Data(resp.StatusCode, resp.Header.Get("Content-Type"), respBody)
 }
 
 func (_this *proxyController) recordActiveConnections(reqType requestType) {
-	metricName := metric.MetricProxyActiveConnections
+	metricName := metric.MetricProxyConnections
 	connsCounter := _this.proxyActiveConns
 
 	if reqType == mirrorRequest {
-		metricName = metric.MetricMirrorActiveConnections
+		metricName = metric.MetricMirrorConnections
 		connsCounter = _this.mirrorActiveConns
 	}
 

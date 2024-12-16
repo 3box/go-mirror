@@ -193,7 +193,13 @@ func (_this serverImpl) panicHandler() gin.HandlerFunc {
 					attribute.String("error", fmt.Sprintf("%v", err)),
 				}
 
-				if recordErr := _this.metricService.RecordRequest(_this.ctx, metric.MetricPanicRecovered, c.Request.Method, c.Request.URL.Path, attrs...); recordErr != nil {
+				if recordErr := _this.metricService.RecordRequest(
+					_this.ctx,
+					metric.MetricPanics,
+					c.Request.Method,
+					c.Request.URL.Path,
+					attrs...,
+				); recordErr != nil {
 					_this.logger.Errorw("failed to record panic metric", "error", recordErr)
 				}
 
