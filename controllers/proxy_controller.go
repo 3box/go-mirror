@@ -142,11 +142,32 @@ func (_this *proxyController) processRequest(
 	targetURL *url.URL,
 	traceID string,
 ) {
-	req := c.Request.Clone(c.Request.Context())
-	req.URL.Scheme = targetURL.Scheme
-	req.URL.Host = targetURL.Host
-	req.Host = targetURL.Host
-	req.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+	// Instead of cloning, create a new request.
+	targetPath := c.Request.URL.Path
+	if c.Request.URL.RawQuery != "" {
+		targetPath += "?" + c.Request.URL.RawQuery
+	}
+
+	req, err := http.NewRequestWithContext(
+		c.Request.Context(),
+		c.Request.Method,
+		targetURL.String()+targetPath,
+		bytes.NewBuffer(bodyBytes),
+	)
+	if err != nil {
+		_this.logger.Errorw(
+			fmt.Sprintf("failed to create %s request", reqType),
+			"error", err,
+			"trace_id", traceID,
+		)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create request"})
+		return
+	}
+
+	// Copy headers from original request
+	for k, vv := range c.Request.Header {
+		req.Header[k] = vv
+	}
 	req.Header.Set("X-Trace-ID", traceID)
 
 	if len(bodyBytes) > 0 {
