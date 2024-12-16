@@ -192,10 +192,20 @@ func (_this *proxyController) sendRequest(reqCtx requestContext) {
 		metricName = metric.MetricMirrorRequest
 	}
 
+	req := reqCtx.request
+
 	atomic.AddInt64(_this.activeConns, 1)
 	// Make the request
-	resp, err := _this.client.Do(reqCtx.request)
+	resp, err := _this.client.Do(req)
 	atomic.AddInt64(_this.activeConns, -1)
+
+	// Log outbound request
+	_this.logger.Debugw(fmt.Sprintf("%s request", reqCtx.reqType),
+		"method", req.Method,
+		"url", req.URL.String(),
+		"headers", req.Header,
+		"trace_id", reqCtx.traceID,
+	)
 
 	if err != nil {
 		_this.logger.Errorw(fmt.Sprintf("%s error", reqCtx.reqType),
@@ -210,16 +220,27 @@ func (_this *proxyController) sendRequest(reqCtx requestContext) {
 	// Ignore error since we are closing the body anyway
 	defer func() { _ = resp.Body.Close() }()
 
+	// Log response
+	_this.logger.Debugw(fmt.Sprintf("%s response", reqCtx.reqType),
+		"method", req.Method,
+		"url", req.URL.String(),
+		"status", resp.StatusCode,
+		"content length", resp.ContentLength,
+		"headers", resp.Header,
+		"latency", time.Since(reqCtx.startTime),
+		"trace_id", reqCtx.traceID,
+	)
+
 	// Record status metrics with the appropriate prefix
 	statusClass := fmt.Sprintf("%dxx", resp.StatusCode/100)
 	_ = _this.metrics.RecordRequest(
 		_this.ctx,
 		fmt.Sprintf("%s_status", metricName),
 		statusClass,
-		reqCtx.request.URL.Path,
+		req.URL.Path,
 		attribute.String("status_class", statusClass),
 		attribute.Int("status_code", resp.StatusCode),
-		attribute.String("method", reqCtx.request.Method),
+		attribute.String("method", req.Method),
 	)
 
 	respBody, err := io.ReadAll(resp.Body)
@@ -247,8 +268,8 @@ func (_this *proxyController) sendRequest(reqCtx requestContext) {
 
 	// Record duration with the same metric name prefix
 	_ = _this.metrics.RecordDuration(_this.ctx, metricName, time.Since(reqCtx.startTime),
-		attribute.String("method", reqCtx.request.Method),
-		attribute.String("path", reqCtx.request.URL.Path),
+		attribute.String("method", req.Method),
+		attribute.String("path", req.URL.Path),
 		attribute.Int("status_code", resp.StatusCode),
 	)
 }
