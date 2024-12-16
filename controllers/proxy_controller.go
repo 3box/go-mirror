@@ -30,14 +30,15 @@ type ProxyController interface {
 }
 
 type proxyController struct {
-	ctx         context.Context
-	cfg         *config.Config
-	logger      logging.Logger
-	metrics     metric.MetricService
-	target      *url.URL
-	mirror      *url.URL
-	client      *http.Client
-	activeConns *int64
+	ctx               context.Context
+	cfg               *config.Config
+	logger            logging.Logger
+	metrics           metric.MetricService
+	target            *url.URL
+	mirror            *url.URL
+	client            *http.Client
+	proxyActiveConns  *int64
+	mirrorActiveConns *int64
 }
 
 type requestType string
@@ -77,13 +78,14 @@ func NewProxyController(
 	}
 
 	pc := &proxyController{
-		ctx:         ctx,
-		cfg:         cfg,
-		logger:      logger,
-		metrics:     metrics,
-		target:      target,
-		mirror:      mirror,
-		activeConns: new(int64),
+		ctx:               ctx,
+		cfg:               cfg,
+		logger:            logger,
+		metrics:           metrics,
+		target:            target,
+		mirror:            mirror,
+		proxyActiveConns:  new(int64),
+		mirrorActiveConns: new(int64),
 	}
 
 	transport := &http.Transport{
@@ -186,21 +188,32 @@ func (_this *proxyController) processRequest(
 }
 
 func (_this *proxyController) sendRequest(reqCtx requestContext) {
+	req := reqCtx.request
+	reqType := reqCtx.reqType
+
 	// Set metric name based on request type
 	metricName := metric.MetricProxyRequest
-	if reqCtx.reqType == mirrorRequest {
+	connsCounter := _this.proxyActiveConns
+
+	if reqType == mirrorRequest {
 		metricName = metric.MetricMirrorRequest
+		connsCounter = _this.mirrorActiveConns
 	}
 
-	req := reqCtx.request
+	atomic.AddInt64(connsCounter, 1)
+	_this.recordActiveConnections(reqType)
 
-	atomic.AddInt64(_this.activeConns, 1)
 	// Make the request
 	resp, err := _this.client.Do(req)
-	atomic.AddInt64(_this.activeConns, -1)
+
+	// Ensure we always decrement the counter when the function exits
+	defer func() {
+		atomic.AddInt64(connsCounter, -1)
+		_this.recordActiveConnections(reqType)
+	}()
 
 	// Log outbound request
-	_this.logger.Debugw(fmt.Sprintf("%s request", reqCtx.reqType),
+	_this.logger.Debugw(fmt.Sprintf("%s request", reqType),
 		"method", req.Method,
 		"url", req.URL.String(),
 		"headers", req.Header,
@@ -208,7 +221,7 @@ func (_this *proxyController) sendRequest(reqCtx requestContext) {
 	)
 
 	if err != nil {
-		_this.logger.Errorw(fmt.Sprintf("%s error", reqCtx.reqType),
+		_this.logger.Errorw(fmt.Sprintf("%s error", reqType),
 			"error", err,
 			"method", req.Method,
 			"url", req.URL.String(),
@@ -216,7 +229,7 @@ func (_this *proxyController) sendRequest(reqCtx requestContext) {
 			"trace_id", reqCtx.traceID,
 			"latency", time.Since(reqCtx.startTime),
 		)
-		if reqCtx.reqType == proxyRequest {
+		if reqType == proxyRequest {
 			reqCtx.ginContext.JSON(http.StatusBadGateway, gin.H{"error": "proxy error"})
 		}
 		return
@@ -225,7 +238,7 @@ func (_this *proxyController) sendRequest(reqCtx requestContext) {
 	defer func() { _ = resp.Body.Close() }()
 
 	// Log response
-	_this.logger.Debugw(fmt.Sprintf("%s response", reqCtx.reqType),
+	_this.logger.Debugw(fmt.Sprintf("%s response", reqType),
 		"method", req.Method,
 		"url", req.URL.String(),
 		"status", resp.StatusCode,
@@ -249,17 +262,17 @@ func (_this *proxyController) sendRequest(reqCtx requestContext) {
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		_this.logger.Errorw(fmt.Sprintf("failed to read %s response", reqCtx.reqType),
+		_this.logger.Errorw(fmt.Sprintf("failed to read %s response", reqType),
 			"error", err,
 			"trace_id", reqCtx.traceID,
 		)
-		if reqCtx.reqType == proxyRequest {
+		if reqType == proxyRequest {
 			reqCtx.ginContext.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read response"})
 		}
 		return
 	}
 
-	if reqCtx.reqType == proxyRequest {
+	if reqType == proxyRequest {
 		for k, vv := range resp.Header {
 			for _, v := range vv {
 				reqCtx.ginContext.Header(k, v)
@@ -275,6 +288,22 @@ func (_this *proxyController) sendRequest(reqCtx requestContext) {
 		attribute.String("method", req.Method),
 		attribute.String("path", req.URL.Path),
 		attribute.Int("status_code", resp.StatusCode),
+	)
+}
+
+func (_this *proxyController) recordActiveConnections(reqType requestType) {
+	metricName := metric.MetricProxyActiveConnections
+	connsCounter := _this.proxyActiveConns
+
+	if reqType == mirrorRequest {
+		metricName = metric.MetricMirrorActiveConnections
+		connsCounter = _this.mirrorActiveConns
+	}
+
+	_ = _this.metrics.RecordGauge(
+		_this.ctx,
+		metricName,
+		float64(atomic.LoadInt64(connsCounter)),
 	)
 }
 

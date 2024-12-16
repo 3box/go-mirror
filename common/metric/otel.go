@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -26,9 +27,10 @@ type otelMetricService struct {
 	meter         metric.Meter
 	logger        logging.Logger
 	reader        *prometheus.Exporter
+	gauges        *sync.Map
 }
 
-func NewOTelMetricService() (MetricService, error) {
+func NewOTelMetricService(logger logging.Logger) (MetricService, error) {
 	// Create a new Prometheus exporter
 	exporter, err := prometheus.New()
 	if err != nil {
@@ -45,6 +47,8 @@ func NewOTelMetricService() (MetricService, error) {
 	return &otelMetricService{
 		meter:  meter,
 		reader: exporter,
+		gauges: new(sync.Map),
+		logger: logger,
 	}, nil
 }
 
@@ -115,4 +119,49 @@ func (_this *otelMetricService) RecordDuration(ctx context.Context, name string,
 
 	histogram.Record(ctx, duration.Seconds(), metric.WithAttributes(normalizedAttrs...))
 	return nil
+}
+
+func (_this *otelMetricService) RecordGauge(ctx context.Context, name string, value float64, attrs ...attribute.KeyValue) error {
+	gaugeKey := fmt.Sprintf("%s_%s", config.ServiceName, name)
+
+	gaugeInterface, _ := _this.gauges.LoadOrStore(gaugeKey, &struct {
+		gauge metric.Float64UpDownCounter
+		once  sync.Once
+	}{})
+
+	gaugeData := gaugeInterface.(*struct {
+		gauge metric.Float64UpDownCounter
+		once  sync.Once
+	})
+
+	gaugeData.once.Do(func() {
+		gauge, err := _this.meter.Float64UpDownCounter(
+			gaugeKey,
+			metric.WithDescription("Gauge measurement"),
+		)
+		if err != nil {
+			_this.logger.Errorw("failed to create gauge", "error", err)
+			return
+		}
+		gaugeData.gauge = gauge
+	})
+
+	if gaugeData.gauge != nil {
+		// Calculate the difference from the previous value to the new value
+		previousValue := _this.getCurrentValue(gaugeKey)
+		diff := value - previousValue
+		gaugeData.gauge.Add(ctx, diff, metric.WithAttributes(attrs...))
+
+		// Store the new value
+		_this.gauges.Store(gaugeKey+"_value", value)
+	}
+
+	return nil
+}
+
+func (_this *otelMetricService) getCurrentValue(key string) float64 {
+	if val, exists := _this.gauges.Load(key + "_value"); exists {
+		return val.(float64)
+	}
+	return 0
 }
