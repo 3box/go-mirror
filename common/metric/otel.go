@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -122,19 +123,28 @@ func (_this *otelMetricService) RecordGauge(ctx context.Context, name string, va
 	gaugeKey := fmt.Sprintf("%s_%s", config.ServiceName, name)
 
 	gaugeInterface, _ := _this.gauges.LoadOrStore(gaugeKey, &struct {
-		gauge metric.Float64UpDownCounter
+		gauge metric.Float64ObservableGauge
+		value atomic.Value
 		once  sync.Once
 	}{})
 
 	gaugeData := gaugeInterface.(*struct {
-		gauge metric.Float64UpDownCounter
+		gauge metric.Float64ObservableGauge
+		value atomic.Value
 		once  sync.Once
 	})
 
 	gaugeData.once.Do(func() {
-		gauge, err := _this.meter.Float64UpDownCounter(
+		gauge, err := _this.meter.Float64ObservableGauge(
 			gaugeKey,
 			metric.WithDescription("Gauge measurement"),
+			metric.WithFloat64Callback(func(_ context.Context, o metric.Float64Observer) error {
+				val := gaugeData.value.Load()
+				if val != nil {
+					o.Observe(val.(float64), metric.WithAttributes(attrs...))
+				}
+				return nil
+			}),
 		)
 		if err != nil {
 			_this.logger.Errorw("failed to create gauge", "error", err)
@@ -143,22 +153,7 @@ func (_this *otelMetricService) RecordGauge(ctx context.Context, name string, va
 		gaugeData.gauge = gauge
 	})
 
-	if gaugeData.gauge != nil {
-		// Calculate the difference from the previous value to the new value
-		previousValue := _this.getCurrentValue(gaugeKey)
-		diff := value - previousValue
-		gaugeData.gauge.Add(ctx, diff, metric.WithAttributes(attrs...))
-
-		// Store the new value
-		_this.gauges.Store(gaugeKey+"_value", value)
-	}
-
+	// Store the new value directly
+	gaugeData.value.Store(value)
 	return nil
-}
-
-func (_this *otelMetricService) getCurrentValue(key string) float64 {
-	if val, exists := _this.gauges.Load(key + "_value"); exists {
-		return val.(float64)
-	}
-	return 0
 }
